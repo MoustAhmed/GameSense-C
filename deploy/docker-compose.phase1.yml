@@ -1,0 +1,43 @@
+# Phase 1: ingest alone. The simulator sends real batches to the Go ingest API,
+# which validates and acknowledges them but discards them (no queue yet).
+# Measures the raw capacity of the ingest API.
+#
+#   make phase1          # start
+#   make phase1-load L=4 # change load
+#   make stats           # live terminal stats
+#   open http://localhost:3000  (dashboard: "GameSense - Phase 1")
+name: gamesense-phase1
+
+services:
+  ingest:
+    build: {context: .., dockerfile: Dockerfile, args: {SERVICE: ingest, TAGS: nokafka}}
+    command: ["-broker", "discard", "-max-inflight", "${MAX_INFLIGHT:-256}"]
+    ports: ["8080:8080"]
+    restart: unless-stopped
+    # Uncomment to test behaviour on a small (free-tier-sized) machine:
+    # deploy: {resources: {limits: {cpus: "1", memory: 512M}}}
+
+  simulator:
+    build: {context: .., dockerfile: Dockerfile, args: {SERVICE: simulator, TAGS: nokafka}}
+    command: ["-ingest", "http://ingest:8080/v1/batch", "-time-scale", "${SIM_SCALE:-24}", "-load", "${SIM_LOAD:-1}",
+              "-batch", "${SIM_BATCH:-500}", "-flush", "${SIM_FLUSH:-100ms}"]
+    ports: ["9101:9101"]
+    restart: unless-stopped
+    depends_on: [ingest]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: ["./prometheus/phase1.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/phase1.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]

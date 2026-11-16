@@ -1,0 +1,197 @@
+# GameSense local stack: 3-broker Redpanda cluster, 2 ingest replicas behind
+# nginx, 3 detector workers, simulator, auditor, Prometheus, Grafana, Console.
+#
+#   make up        # build + start everything
+#   open http://localhost:3000   (Grafana, anonymous admin)
+#   open http://localhost:8081   (Redpanda Console: topics, consumer lag)
+
+x-redpanda: &redpanda
+  image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+  # Durability: the Redpanda image ships /etc/redpanda/redpanda.yaml with
+  # developer_mode: true. In that mode `rpk redpanda start` adds
+  # --unsafe-bypass-fsync=true (no fsync) and writes dev presets including
+  # write_caching_default=true (acks=all returns once a majority holds the write
+  # in memory). Both would make our durability claims meaningless, so:
+  #   - the entrypoint runs `rpk redpanda mode production` before starting, which
+  #     removes developer_mode (rpk start's own --set is applied too late to
+  #     stop the fsync bypass in v24.2.7);
+  #   - init-topics sets the cluster's write_caching_default=false and
+  #     write.caching=false on every topic.
+  # An acks=all write is therefore acked only after 2 of 3 brokers have fsynced it.
+  # Check: `docker logs <broker>` must not show --unsafe-bypass-fsync.
+  entrypoint: ["/bin/bash", "-c", "rpk redpanda mode production >/dev/null && exec /entrypoint.sh \"$$@\"", "--"]
+  healthcheck:
+    test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  volumes: []
+
+x-go-service: &go-service
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment:
+    BROKERS: redpanda-0:9092,redpanda-1:9092,redpanda-2:9092
+
+services:
+  redpanda-0:
+    <<: *redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda-0:9092,external://localhost:19092
+      - --rpc-addr redpanda-0:33145
+      - --advertise-rpc-addr redpanda-0:33145
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --default-log-level=warn
+    ports: ["19092:19092", "9644:9644"]
+    volumes: ["rp0:/var/lib/redpanda/data"]
+
+  redpanda-1:
+    <<: *redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr internal://redpanda-1:9092,external://localhost:29092
+      - --rpc-addr redpanda-1:33145
+      - --advertise-rpc-addr redpanda-1:33145
+      - --seeds redpanda-0:33145
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --default-log-level=warn
+    ports: ["29092:29092"]
+    volumes: ["rp1:/var/lib/redpanda/data"]
+    depends_on: [redpanda-0]
+
+  redpanda-2:
+    <<: *redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:39092
+      - --advertise-kafka-addr internal://redpanda-2:9092,external://localhost:39092
+      - --rpc-addr redpanda-2:33145
+      - --advertise-rpc-addr redpanda-2:33145
+      - --seeds redpanda-0:33145
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --default-log-level=warn
+    ports: ["39092:39092"]
+    volumes: ["rp2:/var/lib/redpanda/data"]
+    depends_on: [redpanda-0]
+
+  # Creates topics once the cluster is healthy. Replication factor 3: a write
+  # is acked only after a Raft majority (2 of 3 brokers) has fsynced it (write
+  # caching is turned off here; init-topics fails if that can't be applied).
+  init-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda-0: {condition: service_healthy}
+      redpanda-1: {condition: service_healthy}
+      redpanda-2: {condition: service_healthy}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        B=redpanda-0:9092,redpanda-1:9092,redpanda-2:9092
+        A=redpanda-0:9644,redpanda-1:9644,redpanda-2:9644
+        # No write caching: acks=all must mean "fsynced on a majority".
+        rpk cluster config set write_caching_default false -X admin.hosts=$$A
+        # Retention bounds disk use. At ~50 B/event compressed x 3 replicas, 30 min
+        # at 50k events/s is ~14 GB. Override with RAW_RETENTION_MS.
+        rpk topic create telemetry.raw -p 24 -r 3 -c retention.ms=${RAW_RETENTION_MS:-1800000} -c segment.bytes=67108864 -c write.caching=false -X brokers=$$B || true
+        rpk topic create detections    -p 6  -r 3 -c write.caching=false -X brokers=$$B || true
+        rpk topic create telemetry.dlq -p 3  -r 3 -c retention.ms=604800000 -c write.caching=false -X brokers=$$B || true
+        # Also enforce it on topics that already existed (re-runs on old volumes).
+        rpk topic alter-config telemetry.raw detections telemetry.dlq --set write.caching=false -X brokers=$$B
+        rpk topic list -X brokers=$$B
+    restart: "no"
+
+  ingest:
+    <<: *go-service
+    build: {context: .., dockerfile: Dockerfile, args: {SERVICE: ingest}}
+    deploy: {replicas: 2}
+    depends_on:
+      init-topics: {condition: service_completed_successfully}
+    stop_grace_period: 30s
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes: ["./nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    ports: ["8080:8080"]
+    depends_on: [ingest]
+
+  worker:
+    <<: *go-service
+    build: {context: .., dockerfile: Dockerfile, args: {SERVICE: worker}}
+    command: ["-job", "detector"]
+    deploy: {replicas: 3}
+    depends_on:
+      init-topics: {condition: service_completed_successfully}
+
+  # Two load-generator shards, each running half of the 55 game servers, so
+  # the simulator itself isn't the bottleneck at billion-event volumes.
+  # SIM_SCALE=24 -> one simulated day per real hour. SIM_LOAD multiplies traffic.
+  simulator-0: &simulator
+    <<: *go-service
+    build: {context: .., dockerfile: Dockerfile, args: {SERVICE: simulator}}
+    command: ["-ingest", "http://lb:8080/v1/batch", "-time-scale", "${SIM_SCALE:-24}", "-load", "${SIM_LOAD:-1}",
+              "-shard", "0", "-shards", "2", "-server-scale", "${SIM_SERVERS:-1}"]
+    ports: ["9101:9101"]
+    depends_on: [lb]
+
+  simulator-1:
+    <<: *simulator
+    command: ["-ingest", "http://lb:8080/v1/batch", "-time-scale", "${SIM_SCALE:-24}", "-load", "${SIM_LOAD:-1}",
+              "-shard", "1", "-shards", "2", "-server-scale", "${SIM_SERVERS:-1}"]
+    ports: ["9111:9101"]
+
+  auditor:
+    <<: *go-service
+    build: {context: .., dockerfile: Dockerfile, args: {SERVICE: auditor}}
+    command: ["-sim-stats", "http://simulator-0:9101/stats,http://simulator-1:9101/stats"]
+    depends_on:
+      init-topics: {condition: service_completed_successfully}
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    environment:
+      KAFKA_BROKERS: redpanda-0:9092,redpanda-1:9092,redpanda-2:9092
+    ports: ["8081:8080"]
+    depends_on:
+      init-topics: {condition: service_completed_successfully}
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro", "prom:/prometheus"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/gamesense.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  rp0: {}
+  rp1: {}
+  rp2: {}
+  prom: {}
