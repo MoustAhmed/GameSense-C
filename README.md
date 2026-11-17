@@ -1,4 +1,4 @@
-# 🎮 GameSense
+# 🎮 GameSense - Anti-Cheat
 
 **A distributed streaming pipeline for multiplayer game telemetry. Horizontally scaled workers consume events from a replicated Kafka-compatible log and detect cheating in real time.**
 
@@ -14,9 +14,9 @@ flowchart TB
     Ingest -->|"Records keyed by match ID"| Log["Replicated telemetry log"]
 
     subgraph Detectors["Anti-cheat consumer group"]
-        W1["Anti-cheat worker 1"]
-        W2["Anti-cheat worker 2"]
-        W3["Anti-cheat worker 3"]
+        W1["Anti-cheat worker 1(AI/ML)"]
+        W2["Anti-cheat worker 2(AI/ML)"]
+        W3["Anti-cheat worker 3(AI/ML)"]
     end
 
     Log --> W1 & W2 & W3
