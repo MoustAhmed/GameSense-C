@@ -1,4 +1,4 @@
-# 🎮 GameSense - Anti-Cheat
+# GameSense -- Anti-Cheat
 
 **A distributed streaming pipeline for multiplayer game telemetry. Horizontally scaled workers consume events from a replicated Kafka-compatible log and detect cheating in real time.**
 
