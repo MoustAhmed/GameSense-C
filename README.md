@@ -9,12 +9,21 @@ This repository is a public code sample from GameSense. It walks through the Go 
 ## Follow a shot through the pipeline
 
 ```mermaid
-flowchart LR
+flowchart TB
     Sim["Game servers"] -->|"Gzipped telemetry batches"| Ingest["Go ingest API"]
-    Ingest -->|"Records keyed by match ID"| Log["Replicated event log"]
-    Log -->|"Detector consumer group"| Worker["Anti-cheat workers"]
+    Ingest -->|"Records keyed by match ID"| Log["Replicated telemetry log"]
+
+    subgraph Detectors["Anti-cheat consumer group"]
+        W1["Anti-cheat worker 1"]
+        W2["Anti-cheat worker 2"]
+        W3["Anti-cheat worker 3"]
+    end
+
+    Log --> W1 & W2 & W3
+    W1 & W2 & W3 --> Results["Detections topic"]
     Log -->|"Separate consumer group"| Audit["Independent auditor"]
-    Worker -->|"Via detections topic"| Audit
+    Results --> Audit
+    Log -. Separate consumer group .-> Analytics["Analytics worker (planned)"]
 ```
 
 1. **Generate the traffic.** The simulator runs 55 game servers across three regions. Each region has its own evening peak. The scripted week adds a patch drop, a reconnect storm, and a tournament final.
